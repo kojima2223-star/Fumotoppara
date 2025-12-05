@@ -1,36 +1,50 @@
 
 # -*- coding: utf-8 -*-
-import os, sys, time, requests, re
+"""
+ふもとっぱら予約カレンダー監視 + LINE Messaging API通知（Selenium最適化＋フォールバック強化版）
+- <table> の候補から「ヘッダーに月日が並ぶもの」を選択
+- ヘッダー<th>の取得は text / innerText / textContent の三段でフォールバック
+- ページ全体HTML・選択テーブルHTML・対象セルHTML/スクショをArtifactsへ保存
+- 「キャンプ宿泊」行の同列<td>を読んで ○／△（残n）／× を判定
+- ×/○→△への変化時のみ通知するオプションあり
+"""
+
+import os, sys, time, re, requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-def env(name, default=None):
+# --------- 環境値 ---------
+def env(name: str, default: str | None = None):
     v = os.environ.get(name)
     if v is None or (isinstance(v, str) and v.strip() == ""):
         return default
     return v
 
-CALENDAR_URL       = env("FUMO_CALENDAR_URL", "https://reserve.fumotoppara.net/reserved/reserved-calendar-list")
-TARGET_CATEGORY    = env("TARGET_CATEGORY_LABEL", "キャンプ宿泊")
-TARGET_DATE_LABEL  = env("TARGET_DATE_LABEL", "12/31")   # 例: 12/31（曜日は含めなくてOK）
-NOTIFY_DIFF_ONLY   = env("NOTIFY_DIFF_ONLY", "0") == "1"
+# 監視設定
+CALENDAR_URL      = env("FUMO_CALENDAR_URL", "https://reserve.fumotoppara.net/reserved/reserved-calendar-list")
+TARGET_CATEGORY   = env("TARGET_CATEGORY_LABEL", "キャンプ宿泊")
+TARGET_DATE_LABEL = env("TARGET_DATE_LABEL", "12/31")  # 例: 12/31（曜日は含めなくてOK）
+NOTIFY_DIFF_ONLY  = env("NOTIFY_DIFF_ONLY", "0") == "1"
 
-CHANNEL_TOKEN      = env("LINE_CHANNEL_TOKEN")
-SEND_MODE          = env("LINE_SEND_MODE", "push")
-TO_USER_ID         = env("LINE_TO_USER_ID", None)
-TO_GROUP_ID        = env("LINE_TO_GROUP_ID", None)
-USER_IDS_CSV       = env("LINE_USER_IDS", "")
-LINE_MESSAGE       = env("LINE_MESSAGE", f"🚨 ふもとっぱら（{TARGET_CATEGORY}）{TARGET_DATE_LABEL} に空き（△）が出ました！\n{CALENDAR_URL}")
+# LINE
+CHANNEL_TOKEN = env("LINE_CHANNEL_TOKEN")
+SEND_MODE     = env("LINE_SEND_MODE", "push")
+TO_USER_ID    = env("LINE_TO_USER_ID", None)
+TO_GROUP_ID   = env("LINE_TO_GROUP_ID", None)
+USER_IDS_CSV  = env("LINE_USER_IDS", "")
+LINE_MESSAGE  = env("LINE_MESSAGE", f"🚨 ふもとっぱら（{TARGET_CATEGORY}）{TARGET_DATE_LABEL} に空き（△）が出ました！\n{CALENDAR_URL}")
 
 HEADERS = {"Content-Type":"application/json","Authorization":f"Bearer {CHANNEL_TOKEN}" if CHANNEL_TOKEN else ""}
 
+# Artifacts
 DUMP_DIR  = "html_dump"
 SHOT_DIR  = "shots"
 CACHE_FILE = "last_status.txt"
 
+# --------- LINE送信 ---------
 def notify_push(to, text):
     r = requests.post("https://api.line.me/v2/bot/message/push", headers=HEADERS,
                       json={"to":to,"messages":[{"type":"text","text":text}]}, timeout=20)
@@ -46,6 +60,7 @@ def notify_multicast(ids, text):
                       json={"to":ids,"messages":[{"type":"text","text":text}]}, timeout=20)
     r.raise_for_status(); print(f"[LINE] Multicast sent({len(ids)}): {r.status_code}")
 
+# --------- ユーティリティ ---------
 def setup_driver():
     opts = Options()
     opts.add_argument("--headless=new")
@@ -54,11 +69,18 @@ def setup_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1440,2400")
     opts.add_argument("--lang=ja-JP")
-    return webdriver.Chrome(options=opts)
+    # ユーザーエージェントを付けて、ヘッドレス検出による描画問題の回避
+    opts.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+    # 自動化検出の緩和
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    drv = webdriver.Chrome(options=opts)
+    return drv
 
-def save(text, path):
+def save_text(text: str, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f: f.write(text)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
 
 def read_last():
     try:
@@ -68,119 +90,126 @@ def read_last():
 def write_last(s):
     with open(CACHE_FILE, "w", encoding="utf-8") as f: f.write(s)
 
-def find_calendar_table(drv):
+def header_texts_from_table(table):
     """
-    カレンダーに該当しそうな<table>を選ぶ。
-    - thead内に日付が並ぶ<th>がある
-    - または1行目<th>群に日付が並ぶ
-    複数テーブルがある場合は、ヘッダーに「12/」や「1/」などの月日が含まれるものを優先。
+    ヘッダー<th>のテキストを text / innerText / textContent で総当たり取得
     """
+    ths = table.find_elements(By.XPATH, ".//thead/tr/th | ./tr[1]/th")
+    texts = []
+    for th in ths:
+        t = th.text.strip().replace("\n", " ")
+        if not t:
+            t = (th.get_attribute("innerText") or "").strip().replace("\n"," ")
+        if not t:
+            t = (th.get_attribute("textContent") or "").strip().replace("\n"," ")
+        texts.append(t)
+    return texts
+
+def choose_calendar_table(drv):
     tables = drv.find_elements(By.TAG_NAME, "table")
     print(f"[Tables] found: {len(tables)}")
-    chosen = None
-    best_score = -1
-
+    chosen = None; best_score = -1
     for idx, t in enumerate(tables):
-        # できるだけ広いヘッダー候補を集める
-        ths = t.find_elements(By.XPATH, ".//thead/tr/th | .//tr[1]/th")
-        texts = [th.text.strip().replace("\n"," ") for th in ths]
+        # 解析用に保存
+        outer = t.get_attribute("outerHTML") or ""
+        save_text(outer, os.path.join(DUMP_DIR, f"table_{idx}.html"))
+
+        texts = header_texts_from_table(t)
         sample = texts[:10]
         print(f"[Table {idx}] header sample:", sample)
-        # スコア：日付らしさで評価（例: "12/31", "1/1" などが含まれる数）
+
         score = sum(1 for x in texts if re.search(r"\d{1,2}/\d{1,2}", x))
         if score > best_score:
             best_score = score; chosen = t
-        # 保存（解析用）
-        html = t.get_attribute("outerHTML") or ""
-        save(html, os.path.join(DUMP_DIR, f"table_{idx}.html"))
-
     return chosen
 
-def get_header_texts(table):
-    """
-    ヘッダー<th>群を最大限拾う（thead優先→1行目→trに複数行ある場合は最初に日付が並ぶ行）
-    """
-    # まず thead
-    ths = table.find_elements(By.XPATH, ".//thead/tr/th")
-    if not ths:
-        # 次に 1行目 tr の th
-        ths = table.find_elements(By.XPATH, "./tr[1]/th")
-    if not ths:
-        # それでも無ければ、th行のうち最もth数が多い行を選ぶ
-        rows = table.find_elements(By.XPATH, ".//tr")
-        best = []
-        max_ths = -1
-        for r in rows:
-            r_ths = r.find_elements(By.XPATH, "./th")
-            if len(r_ths) > max_ths:
-                max_ths = len(r_ths); best = r_ths
-        ths = best
-    texts = [th.text.strip().replace("\n"," ") for th in ths]
-    return texts
-
 def detect_status_with_selenium():
+    # URLが空なら既定へ
+    if not CALENDAR_URL or CALENDAR_URL.strip() == "":
+        print("[Warn] CALENDAR_URL is empty. Fallback to default.")
+        url = "https://reserve.fumotoppara.net/reserved/reserved-calendar-list"
+    else:
+        url = CALENDAR_URL
+
     os.makedirs(DUMP_DIR, exist_ok=True); os.makedirs(SHOT_DIR, exist_ok=True)
     drv = setup_driver()
     try:
-        print(f"[Selenium] GET {CALENDAR_URL}")
-        drv.get(CALENDAR_URL)
+        print(f"[Selenium] GET {url}")
+        drv.get(url)
+
+        # ページ全体の描画待ち + 少し余裕
         WebDriverWait(drv, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        # テーブルの描画を待つ（最大3回リトライ）
-        for attempt in range(3):
+        time.sleep(2.0)
+
+        # ページ全体HTML保存
+        page_html = drv.page_source or ""
+        save_text(page_html, os.path.join(DUMP_DIR, "page_source.html"))
+
+        # テーブル待機（最大5回リトライ）
+        for attempt in range(5):
             tables = drv.find_elements(By.TAG_NAME, "table")
-            if tables: break
+            if tables:
+                break
             time.sleep(1.0)
 
-        table = find_calendar_table(drv)
+        table = choose_calendar_table(drv)
         if not table:
-            print("[Error] No table chosen.")
+            print("[Error] No calendar-like table chosen.")
             return "UNKNOWN"
 
-        header_texts = get_header_texts(table)
+        # 遅延描画の余裕
+        time.sleep(1.0)
+
+        header_texts = header_texts_from_table(table)
         print("[Header] count:", len(header_texts))
         print("[Header] first 12:", header_texts[:12])
-        # 対象日（例: "12/31"）の列インデックス（部分一致）
+
+        # 対象日の列インデックス（部分一致）
         date_idx = -1
         for i, txt in enumerate(header_texts):
-            if TARGET_DATE_LABEL in txt:
+            if txt and (TARGET_DATE_LABEL in txt):
                 date_idx = i; break
         if date_idx < 0:
             print(f"[Error] TARGET_DATE_LABEL '{TARGET_DATE_LABEL}' not found in header.")
-            # 解析用にテーブル全体を保存
-            save(table.get_attribute("outerHTML") or "", os.path.join(DUMP_DIR, "chosen_table.html"))
+            save_text(table.get_attribute("outerHTML") or "", os.path.join(DUMP_DIR, "chosen_table.html"))
             return "UNKNOWN"
 
-        # データ列の <td> は通常「左端<th>がカテゴリ」なので、tdの添字= (date_idx - 1)
+        # 左端<th>はカテゴリ見出しなので、tdの添字は (date_idx - 1)
         td_idx = date_idx - 1
         if td_idx < 0:
             print("[Error] td_idx negative. Header layout may differ.")
-            save(table.get_attribute("outerHTML") or "", os.path.join(DUMP_DIR, "chosen_table.html"))
+            save_text(table.get_attribute("outerHTML") or "", os.path.join(DUMP_DIR, "chosen_table.html"))
             return "UNKNOWN"
 
-        # 「キャンプ宿泊」行を取得（左端<th>にカテゴリ名）
+        # 「キャンプ宿泊」行（左端<th>がカテゴリ名）
         camp_row = table.find_element(
             By.XPATH,
             ".//tr[th[contains(normalize-space(.), 'キャンプ宿泊')] or normalize-space(th[1])='キャンプ宿泊']"
         )
-        # その行の <td> 群
         tds = camp_row.find_elements(By.XPATH, "./td")
         print("[Row] td count:", len(tds))
         if td_idx >= len(tds):
             print(f"[Error] td_idx({td_idx}) >= len(tds)({len(tds)})")
-            save(camp_row.get_attribute("outerHTML") or "", os.path.join(DUMP_DIR, "camp_row.html"))
+            save_text(camp_row.get_attribute("outerHTML") or "", os.path.join(DUMP_DIR, "camp_row.html"))
             return "UNKNOWN"
 
         cell = tds[td_idx]
-        txt = cell.text.strip().replace("\n", " ")
+        # セルテキストは text / innerText / textContent のフォールバック
+        txt = (cell.text or "").strip().replace("\n"," ")
+        if not txt:
+            txt = (cell.get_attribute("innerText") or "").strip().replace("\n"," ")
+        if not txt:
+            txt = (cell.get_attribute("textContent") or "").strip().replace("\n"," ")
         print(f"[Cell] ({TARGET_CATEGORY}/{TARGET_DATE_LABEL}) text:", txt)
+
         # 保存（Artifacts）
-        save(cell.get_attribute("innerHTML") or "", os.path.join(DUMP_DIR, "camp_target_cell.html"))
+        save_text(cell.get_attribute("innerHTML") or "", os.path.join(DUMP_DIR, "camp_target_cell.html"))
         try:
             cell.screenshot(os.path.join(SHOT_DIR, "camp_target_cell.png"))
         except Exception as se:
             print(f"[Shot] Failed: {se}")
 
-        # 判定：○／△（または「残」）／×／その他
+        # 判定
         if ("〇" in txt) or ("○" in txt):
             return "○"
         if ("△" in txt) or ("残" in txt):
