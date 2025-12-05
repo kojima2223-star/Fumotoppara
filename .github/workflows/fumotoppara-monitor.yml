@@ -1,0 +1,41 @@
+
+name: Fumotoppara Calendar Monitor
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 10分間隔（UTC）
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fumotoppara-monitor
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Monitor and notify
+        env:
+          # LINE
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_TO_USER_ID: ${{ secrets.LINE_TO_USER_ID }}
+          LINE_TO_GROUP_ID: ${{ secrets.LINE_TO_GROUP_ID }}
+          LINE_SEND_MODE: push   # broadcastに切替可
+          LINE_USER_IDS: ${{ secrets.LINE_USER_IDS }}
+          LINE_MESSAGE: ${{ vars.LINE_MESSAGE }}
+          # 監視対象
+          FUMO_CALENDAR_URL: ${{ secrets.FUMO_CALENDAR_URL }}
+          TARGET_DATE_LABEL: ${{ secrets.TARGET_DATE_LABEL }}
+          TARGET_DATE_ISO: ${{ secrets.TARGET_DATE_ISO }}
+        run: python monitor_and_notify.py
