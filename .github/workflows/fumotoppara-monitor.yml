@@ -49,3 +49,17 @@ jobs:
           TARGET_DATE_LABEL: ${{ secrets.TARGET_DATE_LABEL }}
           TARGET_DATE_ISO: ${{ secrets.TARGET_DATE_ISO }}
         run: python monitor_and_notify.py
+
+        
+      - name: Upload cell HTML dumps
+        uses: actions/upload-artifact@v4
+        with:
+        name: cell-innerHTML
+        path: html_dump/
+
+      - name: Upload cell screenshots
+        uses: actions/upload-artifact@v4
+        with:
+        name: cell-shots
+        path: shots/
+
