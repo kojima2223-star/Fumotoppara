@@ -2,19 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ふもとっぱら予約カレンダー監視 + LINE Messaging API通知（Selenium最適化版）
-- HTML構造（ヘッダー行+カテゴリ行）に合わせて「キャンプ宿泊」行の対象日セルだけを判定
-- ヘッダー(<tr>/<th>)から列インデックスを取得 → 「キャンプ宿泊」行の同じ列の<td>を読む
-- セルのテキスト（○／△／×／残○）でステータスを判定
-- セルの innerHTML と スクリーンショットを保存（Artifactsで確認）
+- <table> のヘッダー(<tr>/<th>)から対象日列インデックスを取得
+- 「キャンプ宿泊」行(<tr><th>キャンプ宿泊</th>...)の同じ列<td>を直接読む
+- セルのテキスト（○／△／×／残n／ー）で判定
+- 対象セルの innerHTML と スクリーンショットを保存（Artifacts用）
 - ×/○→△へ変化した時のみ通知するオプションあり
 """
 
 import os
 import sys
-import json
 import time
 import requests
-
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -22,23 +20,23 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-# ========= ユーティリティ =========
+# --------- ユーティリティ ---------
 def env(name: str, default: str | None = None):
-    v = os.environ.get(name)
-    if v is None or (isinstance(v, str) and v.strip() == ""):
+    val = os.environ.get(name)
+    if val is None or (isinstance(val, str) and val.strip() == ""):
         return default
-    return v
+    return val
 
 
-# ========= 監視設定 =========
+# --------- 監視設定 ---------
 CALENDAR_URL       = env("FUMO_CALENDAR_URL", "https://reserve.fumotoppara.net/reserved/reserved-calendar-list")
-TARGET_CATEGORY    = env("TARGET_CATEGORY_LABEL", "キャンプ宿泊")  # この行だけを見る
-TARGET_DATE_LABEL  = env("TARGET_DATE_LABEL", "12/31")            # 見出しの表記に合わせる（例：12/31）
-NOTIFY_DIFF_ONLY   = env("NOTIFY_DIFF_ONLY", "0") == "1"          # "1"なら ×/○→△へ変化時のみ通知
+TARGET_CATEGORY    = env("TARGET_CATEGORY_LABEL", "キャンプ宿泊")   # この行だけを見る
+TARGET_DATE_LABEL  = env("TARGET_DATE_LABEL", "12/31")             # ヘッダー表記に合わせる
+NOTIFY_DIFF_ONLY   = env("NOTIFY_DIFF_ONLY", "0") == "1"           # "1"なら ×/○→△への変化時のみ通知
 
-# ========= LINE設定 =========
+# --------- LINE設定 ---------
 CHANNEL_TOKEN      = env("LINE_CHANNEL_TOKEN")
-SEND_MODE          = env("LINE_SEND_MODE", "push")                # push|broadcast|multicast
+SEND_MODE          = env("LINE_SEND_MODE", "push")                 # push|broadcast|multicast
 TO_USER_ID         = env("LINE_TO_USER_ID", None)
 TO_GROUP_ID        = env("LINE_TO_GROUP_ID", None)
 USER_IDS_CSV       = env("LINE_USER_IDS", "")
@@ -49,39 +47,47 @@ HEADERS = {
     "Authorization": f"Bearer {CHANNEL_TOKEN}" if CHANNEL_TOKEN else "",
 }
 
-# ========= 保存（Artifacts用） =========
+# --------- 保存（Artifacts用） ---------
 DUMP_DIR  = "html_dump"
 SHOT_DIR  = "shots"
 CACHE_FILE = "last_status.txt"
 
 
-# ========= LINE送信 =========
+# --------- LINE送信 ---------
 def notify_push(target_id: str, text: str):
-    r = requests.post("https://api.line.me/v2/bot/message/push",
-                      headers=HEADERS,
-                      json={"to": target_id, "messages": [{"type": "text", "text": text}]},
-                      timeout=20)
+    r = requests.post(
+        "https://api.line.me/v2/bot/message/push",
+        headers=HEADERS,
+        json={"to": target_id, "messages": [{"type": "text", "text": text}]},
+        timeout=20,
+    )
     r.raise_for_status()
     print(f"[LINE] Push sent to {target_id}: {r.status_code}")
 
+
 def notify_broadcast(text: str):
-    r = requests.post("https://api.line.me/v2/bot/message/broadcast",
-                      headers=HEADERS,
-                      json={"messages": [{"type": "text", "text": text}]},
-                      timeout=20)
+    r = requests.post(
+        "https://api.line.me/v2/bot/message/broadcast",
+        headers=HEADERS,
+        json={"messages": [{"type": "text", "text": text}]},
+        timeout=20,
+    )
     r.raise_for_status()
     print(f"[LINE] Broadcast sent: {r.status_code}")
 
+
 def notify_multicast(user_ids, text: str):
-    r = requests.post("https://api.line.me/v2/bot/message/multicast",
-                      headers=HEADERS,
-                      json={"to": user_ids, "messages": [{"type": "text", "text": text}]},
-                      timeout=20)
+    r = requests.post(
+        "https://api.line.me/v2/bot/message/multicast",
+        headers=HEADERS,
+        json={"to": user_ids, "messages": [{"type": "text", "text": text}]},
+        timeout=20,
+    )
     r.raise_for_status()
     print(f"[LINE] Multicast sent({len(user_ids)}): {r.status_code}")
 
 
-# ========= ブラウザ起動 =========
+# --------- ブラウザ起動 ---------
 def setup_driver() -> webdriver.Chrome:
     opts = Options()
     opts.add_argument("--headless=new")
@@ -93,13 +99,13 @@ def setup_driver() -> webdriver.Chrome:
     return webdriver.Chrome(options=opts)
 
 
-# ========= 判定ロジック（テーブル構造前提） =========
+# --------- 判定ロジック ---------
 def detect_status_with_selenium() -> str:
     """
-    1) <table> のヘッダー行(<tr>/<th>)を読み、TARGET_DATE_LABEL の列インデックスを特定
-       - 先頭の空<th>を含めたインデックス（0-based）。データ列は th[1]→ td[0] に対応
-    2) 「キャンプ宿泊」行(<tr><th>キャンプ宿泊</th>...)を特定
-    3) 同インデックスの <td> を取得 → テキストで ○／△／×／残○ を判定
+    1) <table> を待機
+    2) ヘッダー<tr>[1]/<th> のテキストから TARGET_DATE_LABEL を含む列インデックスを取得
+       - 先頭の空<th>があるため、ヘッダーの列とデータ<td>の列はオフセットずれに注意
+    3) 「キャンプ宿泊」行を特定 → 同列<td>のテキストで判定
     """
     os.makedirs(DUMP_DIR, exist_ok=True)
     os.makedirs(SHOT_DIR, exist_ok=True)
@@ -109,33 +115,128 @@ def detect_status_with_selenium() -> str:
         print(f"[Selenium] GET {CALENDAR_URL}")
         drv.get(CALENDAR_URL)
 
-        # <table> が描画されるまで待機
+        # <table> を待機
         WebDriverWait(drv, 30).until(EC.presence_of_element_located((By.TAG_NAME, "table")))
         time.sleep(1.0)
 
         table = drv.find_element(By.TAG_NAME, "table")
 
-        # 1) ヘッダー行（1行目）の <th> をすべて取得
+        # 1) ヘッダー<th>配列を取得
         header_ths = table.find_elements(By.XPATH, "./tr[1]/th")
         header_texts = [th.text.strip().replace("\n", " ") for th in header_ths]
-        print("[Header] texts:", header_texts[:12], "...")
+        print("[Header] sample:", header_texts[:12])
 
-        # 日付ラベルに一致する列インデックスを探す（「12/31 水」のように曜日を含むので部分一致）
+        # 2) 対象日列インデックスを検索（部分一致）
         date_idx = -1
         for i, txt in enumerate(header_texts):
             if TARGET_DATE_LABEL in txt:
                 date_idx = i
                 break
-
         if date_idx < 0:
             print(f"[Error] TARGET_DATE_LABEL '{TARGET_DATE_LABEL}' not found in header.")
             return "UNKNOWN"
 
-        # データ列のインデックス：ヘッダーの先頭は空<th>なので、tdの添字は (date_idx - 1)
+        # ヘッダーの先頭<th>は空欄なので、tdの添字は (date_idx - 1)
         td_idx = date_idx - 1
         if td_idx < 0:
-            print("[Error] Calculated td index is negative. Header may not match expected layout.")
+            print("[Error] td index became negative. Header layout mismatch.")
             return "UNKNOWN"
 
-        # 2) 「キャンプ宿泊」行を特定（左端<th>がカテゴリ名）
-        camp_row = table.find_element(By.XPATH, ".//tr[th[contains(normalize-space(.), 'キャンプ宿泊')]]")
+        # 3) 「キャンプ宿泊」行を検索（左端<th>がカテゴリ名）
+        #    normalize-space(.) で改行・空白を揃える
+        camp_row = table.find_element(
+            By.XPATH,
+            ".//tr[normalize-space(th[1])='キャンプ宿泊' or th[contains(normalize-space(.), 'キャンプ宿泊')]]"
+        )
+
+        # 行内の td を列配列として取得
+        tds = camp_row.find_elements(By.XPATH, "./td")
+        if td_idx >= len(tds):
+            print(f"[Error] td_idx({td_idx}) >= len(tds)({len(tds)})")
+            return "UNKNOWN"
+
+        cell = tds[td_idx]
+        cell_text = cell.text.strip().replace("\n", " ")
+        print(f"[Cell] ({TARGET_CATEGORY} / {TARGET_DATE_LABEL}) text:", cell_text)
+
+        # Artifacts保存
+        inner = cell.get_attribute("innerHTML") or ""
+        with open(os.path.join(DUMP_DIR, "camp_target_cell.html"), "w", encoding="utf-8") as f:
+            f.write(inner)
+        try:
+            cell.screenshot(os.path.join(SHOT_DIR, "camp_target_cell.png"))
+        except Exception as se:
+            print(f"[Shot] Failed: {se}")
+
+        # 4) テキストでステータス判定（全角記号と「残n」対応）
+        txt = cell_text  # 例: "△ 残1" / "〇" / "×" / "ー"
+        circle_variants = ["〇", "○"]  # 環境差吸収
+
+        if any(c in txt for c in circle_variants):
+            return "○"
+        if ("△" in txt) or ("残" in txt):
+            return "△"
+        if "×" in txt:
+            return "×"
+        return "UNKNOWN"
+
+    except Exception as e:
+        # 例外はログに流し、UNKNOWNで返す（ワークフロー継続のため）
+        print(f"[Exception] detect_status_with_selenium: {e}")
+        return "UNKNOWN"
+
+    finally:
+        drv.quit()
+
+
+# --------- キャッシュ（重複通知抑止） ---------
+def read_last() -> str:
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+def write_last(s: str) -> None:
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        f.write(s)
+
+
+# --------- メイン ---------
+def main():
+    if not CHANNEL_TOKEN:
+        print("ERROR: LINE_CHANNEL_TOKEN is not set.")
+        sys.exit(2)
+
+    last = read_last()
+    status = detect_status_with_selenium()
+    print(f"[Result] ({TARGET_CATEGORY}) {TARGET_DATE_LABEL} status: {status}")
+
+    # 通知判定
+    should_notify = False
+    if status == "△":
+        should_notify = (last != "△") if NOTIFY_DIFF_ONLY else True
+
+    # 送信
+    if should_notify:
+        if SEND_MODE == "broadcast":
+            notify_broadcast(LINE_MESSAGE)
+        elif SEND_MODE == "multicast":
+            ids = [s for s in USER_IDS_CSV.split(",") if s.strip()]
+            if not ids:
+                print("ERROR: LINE_USER_IDS is empty for multicast.")
+                sys.exit(3)
+            notify_multicast(ids, LINE_MESSAGE)
+        else:
+            target = TO_GROUP_ID or TO_USER_ID
+            if not target:
+                print("ERROR: push mode requires LINE_TO_GROUP_ID or LINE_TO_USER_ID.")
+                sys.exit(3)
+            notify_push(target, LINE_MESSAGE)
+
+    write_last(status)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
