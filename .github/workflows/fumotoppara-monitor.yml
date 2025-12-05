@@ -2,9 +2,9 @@
 name: Fumotoppara Calendar Monitor
 
 on:
-  # 10分おきの定期実行（UTC基準）。JSTで10分おき相当です。
+  # 20分おき（UTC）— 5分/25分/45分に実行（毎時00分を避けて遅延を減らす）
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "5,25,45 * * * *"
   # 手動実行
   workflow_dispatch:
 
