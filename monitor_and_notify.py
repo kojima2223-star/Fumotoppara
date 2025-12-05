@@ -16,6 +16,20 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+
+CACHE_FILE = "last_status.txt"
+
+def read_last() -> str:
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+def write_last(s: str) -> None:
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        f.write(s)
+
 # --------- 環境値 ---------
 def env(name: str, default: str | None = None):
     v = os.environ.get(name)
