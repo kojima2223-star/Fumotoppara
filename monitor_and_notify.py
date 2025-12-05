@@ -66,60 +66,100 @@ def setup_driver() -> webdriver.Chrome:
     driver = webdriver.Chrome(options=opts)
     return driver
 
+
 def detect_status_with_selenium() -> str:
     driver = setup_driver()
     try:
         print(f"[Selenium] GET {CALENDAR_URL}")
         driver.get(CALENDAR_URL)
 
-        # ページの主要要素が描画されるまで待機（必要に応じて安定化）
-        # 例：カレンダーコンテナのCSSクラスやidがわかればそこを待つ
-        # ここでは暫定的にbodyの読み込み＋少し待機
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(2)  # JS描画の余裕時間（必要なら増減）
+        # 本文が描画されるまで待機
+        WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(2)  # 余裕時間（必要なら調整）
 
-        # 1) ISO属性で特定（推奨）
+        # 1) data-date="YYYY-MM-DD" 属性があれば最優先
         if TARGET_DATE_ISO:
-            sel = f'[data-date="{TARGET_DATE_ISO}"]'
-            elems = driver.find_elements(By.CSS_SELECTOR, sel)
-            if elems:
-                text = " ".join(e.text.strip() for e in elems if e.text.strip())
-                print(f"[Detect] ISO {TARGET_DATE_ISO} text: {text}")
-                for mark in ("△","○","×"):
+            sel = f'//*[@data-date="{TARGET_DATE_ISO}"]'
+            iso_nodes = driver.find_elements(By.XPATH, sel)
+            if iso_nodes:
+                cell = iso_nodes[0]
+                # セル内の記号テキストを直接確認
+                text = cell.text.strip()
+                print(f"[Detect] ISO cell text: {text}")
+                for mark in ("△", "○", "×"):
                     if mark in text:
                         return mark
+                # セル内の画像アイコンやtitle/altも確認
+                icons = cell.find_elements(By.XPATH, ".//img | .//*[contains(@class,'status') or contains(@class,'icon')]")
+                for el in icons:
+                    alt = (el.get_attribute("alt") or "").strip()
+                    title = (el.get_attribute("title") or "").strip()
+                    clazz = (el.get_attribute("class") or "").strip()
+                    joined = " ".join([text, alt, title, clazz])
+                    print(f"[Detect] ISO cell inspect: alt={alt} title={title} class={clazz}")
+                    # 文言やクラス名で判定（必要に応じて調整）
+                    if ("空きあり" in joined) or ("available" in joined):
+                        return "○"
+                    if ("残りわずか" in joined) or ("few" in joined):
+                        return "△"
+                    if ("満席" in joined) or ("満室" in joined) or ("full" in joined):
+                        return "×"
+                # ここで未判定なら次の手段（ラベル探索）へフォールバック
 
-        # 2) ラベルテキストで近傍探索
-        # シンプルに全テキストからラベルを含むものを拾う
-        all_text = driver.find_element(By.TAG_NAME, "body").text
-        # ログ用に一部出力
-        print("[Detect] Body text sample:", all_text[:500].replace("\n"," | "))
+        # 2) ラベル（例：12/31）でセルを拾い、親セル内を精査
+        # a) td系（テーブルカレンダー想定）
+        td_nodes = driver.find_elements(
+            By.XPATH,
+            f"//td[contains(normalize-space(.), '{TARGET_DATE_LABEL}')]"
+        )
+        # b) div/span系（カード・グリッド想定）
+        other_nodes = driver.find_elements(
+            By.XPATH,
+            f"//*[self::div or self::span][contains(normalize-space(.), '{TARGET_DATE_LABEL}')]"
+        )
 
-        # ラベルが「12/31」のような形式で掲載されているか探索
-        if TARGET_DATE_LABEL in all_text:
-            # ラベル周辺の行を抽出して、記号があるか見る
-            lines = [ln.strip() for ln in all_text.splitlines() if TARGET_DATE_LABEL in ln]
-            print("[Detect] Lines around label:")
-            for ln in lines[:10]:
-                print("  -", ln)
-                for mark in ("△","○","×"):
-                    if mark in ln:
-                        return mark
+        candidates = td_nodes or other_nodes
+        print(f"[Detect] Found {len(candidates)} candidate cells for label '{TARGET_DATE_LABEL}'.")
 
-        # 上記で拾えなければ、テーブルセル系のパターンも網羅的に見る（負荷低）
-        candidates = driver.find_elements(By.XPATH, f"//*[contains(text(), '{TARGET_DATE_LABEL}')]")
         if candidates:
-            print(f"[Detect] Found {len(candidates)} nodes containing label.")
-            for el in candidates[:10]:
-                txt = el.text.strip()
-                print("  - node:", txt)
-                for mark in ("△","○","×"):
-                    if mark in txt:
+            # 近いセルを順にチェック
+            for cell in candidates[:5]:
+                cell_text = cell.text.strip()
+                print(f"[Detect] Cell text: {cell_text}")
+
+                # まずはセルの直テキストに記号がないか
+                for mark in ("△", "○", "×"):
+                    if mark in cell_text:
                         return mark
 
+                # 子要素のアイコン・ステータス表記を確認
+                # 画像（alt/title）、ステータス用クラス、別spanに記号があるケースを網羅
+                child_elems = cell.find_elements(By.XPATH, ".//img | .//span | .//i | .//*[contains(@class,'status') or contains(@class,'icon') or contains(@class,'reserve') or contains(@class,'availability')]")
+                for el in child_elems:
+                    t = el.text.strip()
+                    alt = (el.get_attribute("alt") or "").strip()
+                    title = (el.get_attribute("title") or "").strip()
+                    clazz = (el.get_attribute("class") or "").strip()
+                    joined = " ".join([t, alt, title, clazz]).lower()
+                    # 記号で判定
+                    if any(m in t for m in ("△", "○", "×")):
+                        for m in ("△", "○", "×"):
+                            if m in t:
+                                return m
+                    # 文言やクラス名で判定（必要に応じて言い換え追加）
+                    if ("空きあり" in joined) or ("available" in joined):
+                        return "○"
+                    if ("残りわずか" in joined) or ("few" in joined):
+                        return "△"
+                    if ("満席" in joined) or ("満室" in joined) or ("full" in joined):
+                        return "×"
+
+        # 3) ここまでで判定できない場合はUNKNOWN
         return "UNKNOWN"
+
     finally:
         driver.quit()
+
 
 def main():
     if not CHANNEL_TOKEN:
