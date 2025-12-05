@@ -1,24 +1,12 @@
 
 # -*- coding: utf-8 -*-
 """
-ふもとっぱら予約カレンダー監視 + LINE Messaging API通知（Selenium版）
-----------------------------------------------------------------------
-・JavaScript描画後のDOMを Selenium で取得し、日付セルの「△/○/×」や
-  画像アイコンの alt/title/class を見て正しく判定します。
-・対象セルの innerHTML をログ出力し、html_dump/ にファイル保存します
-  （Artifactsでダウンロードして構造確認できます）。
-・重複通知防止（×/○ → △ に変化したときだけ通知）のオプション付き。
-
-必要なSecrets / Variables の例：
-- LINE_CHANNEL_TOKEN（必須）
-- LINE_TO_USER_ID または LINE_TO_GROUP_ID（push宛先のいずれか）
-- FUMO_CALENDAR_URL（未設定なら既定URLを使用）
-- TARGET_DATE_LABEL（例：12/31、12月31日）
-- TARGET_DATE_ISO（例：2025-12-31。data-date 属性がある場合は推奨）
-- NOTIFY_DIFF_ONLY（"1"で×/○→△変化時だけ通知）
-- LINE_SEND_MODE（push|broadcast|multicast。既定は push）
-- LINE_USER_IDS（multicast用カンマ区切り）
-- LINE_MESSAGE（任意の通知文。未設定なら既定文）
+ふもとっぱら予約カレンダー監視 + LINE Messaging API通知（Selenium版・カテゴリ「キャンプ宿泊」限定）
+- ページ表示後に「キャンプ宿泊」カテゴリをクリックしてから解析
+- カレンダー本体（例: .calendar-area）配下で日付セルを特定
+- セル内のテキスト／img alt/title/class で △/○/× を判定
+- セルの innerHTML と スクリーンショットを保存（Artifactsで確認）
+- ×/○→△に変化したときだけ通知のオプションあり
 """
 
 import os
@@ -35,40 +23,38 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-# ========= ユーティリティ =========
 def env(name: str, default: str | None = None):
-    """空文字は未設定扱いにして default を返す"""
     val = os.environ.get(name)
     if val is None or (isinstance(val, str) and val.strip() == ""):
         return default
     return val
 
 
-# ========= 監視対象設定 =========
-CALENDAR_URL      = env("FUMO_CALENDAR_URL", "https://reserve.fumotoppara.net/reserved/reserved-calendar-list")
-TARGET_DATE_LABEL = env("TARGET_DATE_LABEL", "12/31")      # 画面表記に合わせる（例：12/31／12月31日）
-TARGET_DATE_ISO   = env("TARGET_DATE_ISO", None)           # 例：2025-12-31（data-date があるDOMなら推奨）
-NOTIFY_DIFF_ONLY  = env("NOTIFY_DIFF_ONLY", "0") == "1"    # "1" なら ×/○→△ の変化時だけ通知
+# ===== 監視対象設定 =====
+CALENDAR_URL       = env("FUMO_CALENDAR_URL", "https://reserve.fumotoppara.net/reserved/reserved-calendar-list")
+TARGET_CATEGORY    = env("TARGET_CATEGORY_LABEL", "キャンプ宿泊")   # ← カテゴリ名（可視テキスト）
+TARGET_DATE_LABEL  = env("TARGET_DATE_LABEL", "12/31")              # 画面表示どおり（例：12/31 / 12月31日）
+TARGET_DATE_ISO    = env("TARGET_DATE_ISO", None)                   # 例：2025-12-31（data-date属性があれば推奨）
+NOTIFY_DIFF_ONLY   = env("NOTIFY_DIFF_ONLY", "0") == "1"            # "1"なら ×/○→△ の変化時のみ通知
 
-# ========= LINE設定 =========
-CHANNEL_TOKEN     = env("LINE_CHANNEL_TOKEN")
-SEND_MODE         = env("LINE_SEND_MODE", "push")          # push|broadcast|multicast
-TO_USER_ID        = env("LINE_TO_USER_ID", None)
-TO_GROUP_ID       = env("LINE_TO_GROUP_ID", None)
-USER_IDS_CSV      = env("LINE_USER_IDS", "")
-LINE_MESSAGE      = env("LINE_MESSAGE", f"🚨 ふもとっぱら {TARGET_DATE_LABEL} に空き（△）が出ました！\n{CALENDAR_URL}")
+# ===== LINE設定 =====
+CHANNEL_TOKEN      = env("LINE_CHANNEL_TOKEN")
+SEND_MODE          = env("LINE_SEND_MODE", "push")                  # push|broadcast|multicast
+TO_USER_ID         = env("LINE_TO_USER_ID", None)
+TO_GROUP_ID        = env("LINE_TO_GROUP_ID", None)
+USER_IDS_CSV       = env("LINE_USER_IDS", "")
+LINE_MESSAGE       = env("LINE_MESSAGE", f"🚨 ふもとっぱら（{TARGET_CATEGORY}）{TARGET_DATE_LABEL} に空き（△）が出ました！\n{CALENDAR_URL}")
 
-HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {CHANNEL_TOKEN}" if CHANNEL_TOKEN else "",
-}
+HEADERS = {"Content-Type": "application/json",
+           "Authorization": f"Bearer {CHANNEL_TOKEN}" if CHANNEL_TOKEN else ""}
 
-# ログ／Artifacts用のダンプ先
-DUMP_DIR = "html_dump"
+# ===== 保存先（Artifacts用） =====
+DUMP_DIR  = "html_dump"
+SHOT_DIR  = "shots"
 CACHE_FILE = "last_status.txt"
 
 
-# ========= LINE送信 =========
+# ===== LINE送信 =====
 def notify_push(target_id: str, text: str):
     url = "https://api.line.me/v2/bot/message/push"
     payload = {"to": target_id, "messages": [{"type": "text", "text": text}]}
@@ -76,14 +62,12 @@ def notify_push(target_id: str, text: str):
     r.raise_for_status()
     print(f"[LINE] Push sent to {target_id}: {r.status_code}")
 
-
 def notify_broadcast(text: str):
     url = "https://api.line.me/v2/bot/message/broadcast"
     payload = {"messages": [{"type": "text", "text": text}]}
     r = requests.post(url, headers=HEADERS, json=payload, timeout=20)
     r.raise_for_status()
     print(f"[LINE] Broadcast sent: {r.status_code}")
-
 
 def notify_multicast(user_ids, text: str):
     url = "https://api.line.me/v2/bot/message/multicast"
@@ -93,9 +77,8 @@ def notify_multicast(user_ids, text: str):
     print(f"[LINE] Multicast sent({len(user_ids)} users): {r.status_code}")
 
 
-# ========= ブラウザ起動 =========
+# ===== ブラウザ起動 =====
 def setup_driver() -> webdriver.Chrome:
-    """ubuntu-latest + Google Chrome（headless）で動作。selenium-manager利用。"""
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -103,101 +86,186 @@ def setup_driver() -> webdriver.Chrome:
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1280,2200")
     opts.add_argument("--lang=ja-JP")
-
-    # そのまま起動（chromedriverはselenium-managerが解決することが多い）
-    driver = webdriver.Chrome(options=opts)
-    return driver
+    return webdriver.Chrome(options=opts)
 
 
-# ========= ステータス判定 =========
-def detect_status_with_selenium() -> str:
+# ===== カレンダールート待機 =====
+def wait_calendar_root(driver):
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    time.sleep(1.2)
+    selectors = [
+        ".calendar-area", "#calendar",
+        "[class*='calendar']", "[class*='reserve']"
+    ]
+    for sel in selectors:
+        elems = driver.find_elements(By.CSS_SELECTOR, sel)
+        if elems:
+            print(f"[Root] Found calendar root by '{sel}' ({len(elems)} nodes)")
+            return elems[0]
+    print("[Root] Calendar root not found. Fallback to <body>.")
+    return driver.find_element(By.TAG_NAME, "body")
+
+
+# ===== カテゴリ選択（「キャンプ宿泊」をクリック） =====
+def select_category(driver):
     """
-    1) data-date="YYYY-MM-DD" があれば最優先でそのセルを拾う
-    2) なければラベル（12/31 等）を含む td/div/span を候補にして、
-       同一セル内のテキスト／img alt／title／class を総当たりで評価
-    3) innerHTML をログ／ファイル保存（Artifacts用）
+    ページ上のボタン/タブのうち、可視テキストに TARGET_CATEGORY が含まれるものをクリック。
+    見つからない場合は aria-label / title / data-* も試す。
     """
+    # 候補セレクタ群：button, a, div など
+    candidates = []
+    for by, sel in [
+        (By.XPATH, f"//button[contains(normalize-space(.), '{TARGET_CATEGORY}')]"),
+        (By.XPATH, f"//a[contains(normalize-space(.), '{TARGET_CATEGORY}')]"),
+        (By.XPATH, f"//*[self::div or self::span][contains(normalize-space(.), '{TARGET_CATEGORY}')]"),
+    ]:
+        found = driver.find_elements(by, sel)
+        if found:
+            candidates = found
+            break
+
+    # aria-label / title での一致もトライ
+    if not candidates:
+        for by, sel in [
+            (By.XPATH, f"//*[@aria-label='{TARGET_CATEGORY}']"),
+            (By.XPATH, f"//*[@title='{TARGET_CATEGORY}']"),
+        ]:
+            found = driver.find_elements(by, sel)
+            if found:
+                candidates = found
+                break
+
+    if candidates:
+        btn = candidates[0]
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        time.sleep(0.3)
+        print(f"[Category] Click: tag={btn.tag_name} text={(btn.text or '').strip()}")
+        btn.click()
+        # カテゴリ切り替え後の再描画を待つ（カレンダー本体が変わる想定）
+        time.sleep(1.5)
+        return True
+    else:
+        print(f"[Category] '{TARGET_CATEGORY}' not found. Continue without clicking.")
+        return False
+
+
+# ===== 日付セル候補の抽出 =====
+def get_candidate_day_cells(root, driver):
+    cells = []
+    if TARGET_DATE_ISO:
+        cells = root.find_elements(By.CSS_SELECTOR, f'[data-date="{TARGET_DATE_ISO}"]')
+        if not cells:
+            cells = root.find_elements(By.XPATH, f'.//*[@data-date="{TARGET_DATE_ISO}"]')
+    if not cells:
+        for xp in [
+            f".//table//td[contains(normalize-space(.), '{TARGET_DATE_LABEL}')]",
+            f".//*[self::div or self::span][contains(normalize-space(.), '{TARGET_DATE_LABEL}')]",
+            f".//*[self::button or self::li][contains(normalize-space(.), '{TARGET_DATE_LABEL}')]",
+        ]:
+            found = root.find_elements(By.XPATH, xp)
+            if found:
+                cells = found
+                break
+    print(f"[Candidates] {len(cells)} nodes under calendar root for '{TARGET_DATE_LABEL or TARGET_DATE_ISO}'.")
+    return cells
+
+
+def normalize_to_day_cell(node, root):
+    target = node
+    for _ in range(6):
+        clazz = (target.get_attribute("class") or "").lower()
+        if any(k in clazz for k in ["day", "date", "cell", "item", "slot", "card", "reserve"]):
+            return target
+        if target.tag_name.lower() in ["td", "li", "div", "button"]:
+            return target
+        ancestors = target.find_elements(By.XPATH, "..")
+        if ancestors:
+            target = ancestors[0]
+        else:
+            break
+    return node
+
+
+def evaluate_cell_status(cell, idx: int, driver) -> str:
     os.makedirs(DUMP_DIR, exist_ok=True)
+    os.makedirs(SHOT_DIR, exist_ok=True)
+
+    inner = cell.get_attribute("innerHTML") or ""
+    with open(os.path.join(DUMP_DIR, f"cell_{idx}.html"), "w", encoding="utf-8") as f:
+        f.write(inner)
+    print("[Debug] Cell innerHTML:", (inner[:2000] + ("... (trim)" if len(inner) > 2000 else "")))
+
+    try:
+        cell.screenshot(os.path.join(SHOT_DIR, f"cell_{idx}.png"))
+        print(f"[Shot] Saved shots/cell_{idx}.png")
+    except Exception as e:
+        print(f"[Shot] Failed: {e}")
+
+    cell_text = (cell.text or "").strip()
+    for m in ("△", "○", "×"):
+        if m in cell_text:
+            return m
+
+    child_elems = cell.find_elements(
+        By.XPATH,
+        ".//img | .//span | .//i | .//*[contains(@class,'status') or contains(@class,'icon') or contains(@class,'reserve') or contains(@class,'availability') or contains(@class,'full') or contains(@class,'few') or contains(@class,'available') or contains(@class,'soldout') or contains(@class,'close') or contains(@class,'open')]"
+    )
+    for el in child_elems:
+        t      = (el.text or "").strip()
+        alt    = (el.get_attribute("alt") or "").strip()
+        title  = (el.get_attribute("title") or "").strip()
+        clazz  = (el.get_attribute("class") or "").strip().lower()
+        aria   = (el.get_attribute("aria-label") or "").strip().lower()
+        joined = " ".join([t, alt, title, clazz, aria]).lower()
+        print(f"[Inspect] child: text={t} alt={alt} title={title} class={clazz} aria={aria}")
+
+        if any(m in t for m in ("△", "○", "×")):
+            for m in ("△", "○", "×"):
+                if m in t:
+                    return m
+        if ("満席" in joined) or ("満室" in joined) or ("受付終了" in joined) or ("予約不可" in joined) or ("soldout" in joined) or ("full" in joined) or ("close" in joined):
+            return "×"
+        if ("残りわずか" in joined) or ("残少" in joined) or ("few" in joined) or ("limited" in joined):
+            return "△"
+        if ("空きあり" in joined) or ("空き" in joined) or ("available" in joined) or ("open" in joined) or ("受付中" in joined):
+            return "○"
+
+    return "UNKNOWN"
+
+
+def detect_status_with_selenium() -> str:
     driver = setup_driver()
     try:
         print(f"[Selenium] GET {CALENDAR_URL}")
         driver.get(CALENDAR_URL)
 
-        # 本文が描画されるまで待機（必要に応じて対象コンテナに変更）
-        WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(2)  # JS描画余裕
+        # カテゴリを「キャンプ宿泊」に絞る
+        selected = select_category(driver)
+        root = wait_calendar_root(driver)  # カテゴリ切替後の本体を待機
 
-        # --- 1) ISO属性優先 ---
-        cells = []
-        if TARGET_DATE_ISO:
-            # CSS と XPath の両方で拾う（実装差異対策）
-            css_elems = driver.find_elements(By.CSS_SELECTOR, f'[data-date="{TARGET_DATE_ISO}"]')
-            xpath_elems = driver.find_elements(By.XPATH, f'//*[@data-date="{TARGET_DATE_ISO}"]')
-            cells = css_elems if css_elems else xpath_elems
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        print("[Detect] Body text sample:", body_text[:400].replace("\n", " | "))
+        if selected:
+            print(f"[Detect] Category '{TARGET_CATEGORY}' likely applied (post-click).")
 
-        # --- 2) ラベルで候補抽出（td優先 → なければdiv/span） ---
-        if not cells:
-            cells = driver.find_elements(By.XPATH, f"//table//td[contains(normalize-space(.), '{TARGET_DATE_LABEL}')]")
-            if not cells:
-                cells = driver.find_elements(By.XPATH, f"//*[self::div or self::span][contains(normalize-space(.), '{TARGET_DATE_LABEL}')]")
+        cells_raw = get_candidate_day_cells(root, driver)
+        if not cells_raw:
+            print("[Detect] No candidate cells found under calendar root.")
+            return "UNKNOWN"
 
-        print(f"[Detect] Candidate cells: {len(cells)}")
+        for i, node in enumerate(cells_raw[:12]):
+            day_cell = normalize_to_day_cell(node, root)
+            print(f"[Candidate] {i}: tag={day_cell.tag_name} class={(day_cell.get_attribute('class') or '')}")
+            status = evaluate_cell_status(day_cell, i, driver)
+            if status in ("△", "○", "×"):
+                return status
 
-        # 候補セルを順に精査（最初の一致で返す）
-        for idx, cell in enumerate(cells[:12]):
-            cell_text = (cell.text or "").strip()
-            inner = cell.get_attribute("innerHTML") or ""
-            # ログ＆ファイル保存（Artifacts）
-            print("[Debug] Cell text:", cell_text)
-            print("[Debug] Cell innerHTML:", (inner[:2000] + ("... (trim)" if len(inner) > 2000 else "")))
-            with open(os.path.join(DUMP_DIR, f"cell_{idx}.html"), "w", encoding="utf-8") as f:
-                f.write(inner)
-
-            # 直テキストに記号があるなら即返す
-            for m in ("△", "○", "×"):
-                if m in cell_text:
-                    return m
-
-            # 子要素（img/span/i）を総当たりで評価
-            child_elems = cell.find_elements(
-                By.XPATH,
-                ".//img | .//span | .//i | .//*[contains(@class,'status') or contains(@class,'icon') or contains(@class,'reserve') or contains(@class,'availability') or contains(@class,'full') or contains(@class,'few') or contains(@class,'available')]"
-            )
-            for el in child_elems:
-                t      = (el.text or "").strip()
-                alt    = (el.get_attribute("alt") or "").strip()
-                title  = (el.get_attribute("title") or "").strip()
-                clazz  = (el.get_attribute("class") or "").strip()
-                aria   = (el.get_attribute("aria-label") or "").strip()
-
-                joined = " ".join([t, alt, title, clazz, aria]).lower()
-                print(f"[Inspect] child: text={t} alt={alt} title={title} class={clazz} aria={aria}")
-
-                # 記号優先
-                if any(m in t for m in ("△", "○", "×")):
-                    for m in ("△", "○", "×"):
-                        if m in t:
-                            return m
-
-                # 文言・クラス名で判定（必要に応じて語彙を追加）
-                # ×（満席・受付終了など）
-                if ("満席" in joined) or ("満室" in joined) or ("受付終了" in joined) or ("予約不可" in joined) or ("soldout" in joined) or ("full" in joined):
-                    return "×"
-                # △（残りわずか・limited）
-                if ("残りわずか" in joined) or ("残少" in joined) or ("few" in joined) or ("limited" in joined):
-                    return "△"
-                # ○（空きあり・available）
-                if ("空きあり" in joined) or ("空き" in joined) or ("available" in joined) or ("open" in joined) or ("受付中" in joined):
-                    return "○"
-
-        # 候補があっても判定できない
         return "UNKNOWN"
-
     finally:
         driver.quit()
 
 
-# ========= 重複通知キャッシュ =========
+# ===== キャッシュ =====
 def read_last() -> str:
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
@@ -205,53 +273,43 @@ def read_last() -> str:
     except FileNotFoundError:
         return ""
 
-
 def write_last(s: str) -> None:
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         f.write(s)
 
 
-# ========= メイン =========
+# ===== メイン =====
 def main():
     if not CHANNEL_TOKEN:
-        print("ERROR: LINE_CHANNEL_TOKEN is not set.")
-        sys.exit(2)
+        print("ERROR: LINE_CHANNEL_TOKEN is not set."); sys.exit(2)
 
     os.makedirs(DUMP_DIR, exist_ok=True)
+    os.makedirs(SHOT_DIR, exist_ok=True)
 
     last = read_last()
     status = detect_status_with_selenium()
-    print(f"[Result] {TARGET_DATE_LABEL} status: {status}")
+    print(f"[Result] ({TARGET_CATEGORY}) {TARGET_DATE_LABEL} status: {status}")
 
-    # 通知判定
     should_notify = False
     if status == "△":
-        if NOTIFY_DIFF_ONLY:
-            should_notify = (last != "△")
-        else:
-            should_notify = True
+        should_notify = (last != "△") if NOTIFY_DIFF_ONLY else True
 
-    # 送信
     if should_notify:
         if SEND_MODE == "broadcast":
-            notify_broadcast(LINE_MESSAGE)  # 友だち全員へ
+            notify_broadcast(LINE_MESSAGE)
         elif SEND_MODE == "multicast":
             ids = [s for s in USER_IDS_CSV.split(",") if s.strip()]
             if not ids:
-                print("ERROR: LINE_USER_IDS is empty for multicast.")
-                sys.exit(3)
+                print("ERROR: LINE_USER_IDS is empty for multicast."); sys.exit(3)
             notify_multicast(ids, LINE_MESSAGE)
         else:
             target = TO_GROUP_ID or TO_USER_ID
             if not target:
-                print("ERROR: push mode requires LINE_TO_GROUP_ID or LINE_TO_USER_ID.")
-                sys.exit(3)
+                print("ERROR: push mode requires LINE_TO_GROUP_ID or LINE_TO_USER_ID."); sys.exit(3)
             notify_push(target, LINE_MESSAGE)
 
-    # キャッシュ更新
     write_last(status)
     sys.exit(0)
-
 
 if __name__ == "__main__":
     main()
