@@ -3,7 +3,7 @@ name: Fumotoppara Calendar Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # 10分間隔（UTC）
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -22,16 +22,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      # Chromeをインストール（公式aptリポジトリ）
+      - name: Install Google Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Monitor and notify
+      - name: Monitor and notify (Selenium)
         env:
           # LINE
           LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
           LINE_TO_USER_ID: ${{ secrets.LINE_TO_USER_ID }}
           LINE_TO_GROUP_ID: ${{ secrets.LINE_TO_GROUP_ID }}
-          LINE_SEND_MODE: push   # broadcastに切替可
+          LINE_SEND_MODE: push
           LINE_USER_IDS: ${{ secrets.LINE_USER_IDS }}
           LINE_MESSAGE: ${{ vars.LINE_MESSAGE }}
           # 監視対象
